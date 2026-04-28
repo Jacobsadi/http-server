@@ -20,12 +20,10 @@ export type DynBuf = {
 }
 export function cutMessage(buf: DynBuf): null | Buffer {
     const idx = buf.data.subarray(0, buf.length).indexOf('\\n')
-    console.log('idx', idx);
     if(idx < 0 ) {
         return null
     }
     const msg = Buffer.from(buf.data.subarray(0, idx+2))
-    console.log('msg', msg.toString());
     bufPop(buf, idx+2)
     return msg;
     
@@ -56,7 +54,6 @@ function soInit(socket: net.Socket): TCPConn {
     socket.on('data', (data: Buffer) => {
         console.assert(conn.reader);
         socket.pause();
-        console.log('data received', data.toString());
         conn.reader!.resolve(data);
         conn.reader = null;
     });
@@ -141,7 +138,6 @@ async function serverClient(socket: net.Socket): Promise<void> {
 }
 
 async function newConn(socket: net.Socket): Promise<void> {
- console.log('New Connection', socket.remoteAddress, socket.remotePort);
  try {
     await serverClient(socket)
  } catch (e) {
@@ -152,7 +148,21 @@ async function newConn(socket: net.Socket): Promise<void> {
 }
 
 
-const server = net.createServer({pauseOnConnect: true});
-server.on('error', (err: Error) => { throw err; });
-server.on('connection', newConn);
-server.listen({host: '127.0.0.1', port: 1234});
+// Run demo server only when executed directly (not when imported)
+async function runIfMain(): Promise<void> {
+    // ESM-compatible "require.main === module" check
+    try {
+        const { pathToFileURL } = await import('url');
+        const mainUrl = pathToFileURL(process.argv[1]).href;
+        if (import.meta.url === mainUrl) {
+            const server = net.createServer({pauseOnConnect: true});
+            server.on('error', (err: Error) => { throw err; });
+            server.on('connection', newConn);
+            server.listen({host: '127.0.0.1', port: 1234});
+        }
+    } catch {
+        // ignore
+    }
+}
+// eslint-disable-next-line @typescript-eslint/no-floating-promises
+runIfMain();

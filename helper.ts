@@ -1,5 +1,24 @@
-import { bufPop, DynBuf, TCPConn } from "./http-server-promise";
-import { HTTPReq } from "./types";
+import { version } from "os";
+import { bufPop, bufPush, DynBuf, TCPConn } from "./http-server-promise";
+import { BodyReader, BufferGenerator, HTTPReq, HTTPRes } from "./types";
+import { soRead, soWrite } from "./http";
+import * as fs from 'fs/promises'
+import * as path from 'path'
+
+export class HTTPError extends Error {
+    code: number;
+    
+    constructor(codeOrMessage: number | string, message?: string) {
+        if (typeof codeOrMessage === 'number') {
+            super(message || '');
+            this.code = codeOrMessage;
+        } else {
+            super(codeOrMessage);
+            this.code = 500;
+        }
+        this.name = 'HTTPError';
+    }
+}
 
 export function splitLines(data: Buffer): Buffer[] {
     const lines: Buffer[] = [];
@@ -43,7 +62,7 @@ export function parseRequestLine(line: Buffer): [string, Buffer, string] {
     }
     
     const method = line.subarray(0, firstSpace).toString('ascii');
-    const uri = line.subarray(firstSpace + 1, secondSpace);
+    const uri = Buffer.from(line.subarray(firstSpace + 1, secondSpace));
     const version = line.subarray(secondSpace + 1).toString('ascii');
     
     return [method, uri, version];
@@ -117,7 +136,7 @@ export function validateHeader(h: Buffer): boolean {
 const kMaxHeaderLen = 1024 * 8;
 export function cutMessage(buf: DynBuf): null | HTTPReq {
     // the end of the header is \r\n\r\n
-    const idx = buf.data.subarray(0, buf.data.length).indexOf('\r\n\r\n');
+	const idx = buf.data.subarray(0, buf.length).indexOf('\r\n\r\n');
     if(idx < 0){
         if(buf.length >= kMaxHeaderLen){
             throw new HTTPError(413, 'header is too large')
@@ -125,7 +144,8 @@ export function cutMessage(buf: DynBuf): null | HTTPReq {
         return null 
     }
     // parse and remove header 
-    const msg = parseHTTReq(buf.data.subarray(0, idx + 4))
+    const msgBuf = buf.data.subarray(0, idx + 4);
+    const msg = parseHTTReq(msgBuf)
     bufPop(buf, idx+4)
     return msg
 }
@@ -135,6 +155,7 @@ function parseHTTReq(data: Buffer): HTTPReq {
     const lines: Buffer[] = splitLines(data);
     // get the first line URI METHOD VERSION 
     const [method, uri, version] = parseRequestLine(lines[0])
+
     // header fields in format NAME : VALUE
     const headers: Buffer[] = []
     for (let i=1; i < lines.length - 1; i++){
@@ -147,7 +168,7 @@ function parseHTTReq(data: Buffer): HTTPReq {
     // the header ends by an empty line
     console.assert(lines[lines.length - 1].length === 0);
     return {
-        method: method, uri: uri, version: version, headers: headers,
+		method: method, uri: uri, version: version, headers: headers,
     };
 }
 
@@ -180,8 +201,253 @@ function fieldGet(headers: Buffer[], key: string): null | Buffer {
 }
 
 // BodyReader from an HTTP request
-function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq) {
+export function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq) {
     let bodyLen = -1; 
     const contentLen = fieldGet(req.headers, 'Content-Length');
+    if(contentLen){
+        bodyLen = parseInt(contentLen.toString('latin1'))
+        if(isNaN(bodyLen)){
+            throw new HTTPError(400, 'bad Content-Length')
+        }
+
+    }
+    const bodyAllowed = !(req.method === 'GET' || req.method === 'HEAD');
+    const chunked = fieldGet(req.headers, 'Transfer-Encoding')?.equals(Buffer.from('chunked')) || false;
+    if(!bodyAllowed && (bodyLen > 0 || chunked)){
+        throw new HTTPError(400, 'body not allowed ')
+    }
+    if(!bodyAllowed){
+        bodyLen = 0;
+    }
+    if(bodyLen > 0){
+        return readerFromConnLength(conn, buf, bodyLen);
+    } else if(chunked){
+        throw new HTTPError(500, 'DO not support chunked for now ')
+    } else {
+        // No body (GET, HEAD, or requests without Content-Length)
+        return readFromMemory(Buffer.from('Hi'));
+    }
+}
+
+function readerFromConnLength(conn: TCPConn, buf: DynBuf, remain: number): BodyReader {
+    return {
+        length: remain,
+        read: async (): Promise<Buffer> => {
+            if(remain === 0){
+                return Buffer.from('');
+            }
+            if(buf.length === 0){
+                const data = await soRead(conn);
+                bufPush(buf, data);
+                if(data.length === 0){
+                    throw new HTTPError(400, 'Unexpected EOF from HTTP body')
+                }
+            }
+            const consume = Math.min(buf.length, remain);
+            remain -= consume;
+            const data = Buffer.from(buf.data.subarray(0, consume));
+            bufPop(buf, consume)
+            return data;
+        }
+
+    }
+}
+
+export async function handleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
+    const uri = req.uri.toString('latin1');
+    
+    // Handle /files requests
+    if (uri.startsWith('/files')) {
+        return await serveStaticFile(uri);
+    }
+    
+    let resp: BodyReader;
+    switch(uri){
+        case '/echo':
+            resp = body;
+            break;
+        case '/sleep':
+            resp = readerFromGenerator(countSheep())
+            break;
+        default:
+            resp = readFromMemory(Buffer.from('hello zebi, how are you?'));
+            break;
+    }
+    return {
+        code: 200,
+        headers: [Buffer.from('Server: My First HTTP server')],
+        body: resp
+
+    }
+}
+
+async function serveStaticFile(uri: string): Promise<HTTPRes> {
+    // Remove /files prefix and get the file path
+    const filePath = uri.substring('/files'.length) || '/';
+    // Remove leading slash and resolve relative to current directory
+    const relativePath = filePath.startsWith('/') ? filePath.substring(1) : filePath;
+    const fullPath = path.join(process.cwd(), relativePath);
+    
+    // Normalize to prevent directory traversal attacks
+    const normalizedPath = path.normalize(fullPath);
+    const cwd = process.cwd();
+    if (!normalizedPath.startsWith(cwd)) {
+        throw new HTTPError(403, 'Forbidden: Invalid path');
+    }
+    
+    let fp: fs.FileHandle | null = null;
+    try {
+        fp = await fs.open(normalizedPath, 'r');
+        const stat = await fp.stat();
+        if (!stat.isFile()) {
+            throw new HTTPError(404, 'Not Found: Not a file');
+        }
+        const size = stat.size;
+        const reader: BodyReader = readerFromStaticFile(fp, size);
+        fp = null; // Don't close here, reader will handle it
+        
+        return {
+            code: 200,
+            headers: [Buffer.from('Server: My First HTTP server')],
+            body: reader
+        };
+    } catch (exc) {
+        if (exc instanceof HTTPError) {
+            throw exc;
+        }
+        throw new HTTPError(404, 'Not Found');
+    } finally {
+        if (fp) {
+            await fp.close();
+        }
+    }
+}
+async function *countSheep(): BufferGenerator {
+    for (let i = 0; i < 100; i++) {
+    // sleep 1s, then output the counter
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    yield Buffer.from(`${i}\n`);
+    }
+}
+    
+export function readerFromGenerator(gen: BufferGenerator): BodyReader {
+    return {
+        length: -1,
+        read: async (): Promise<Buffer> => {
+            const r = await gen.next();
+            if(r.done){
+                return Buffer.from('')
+            } else {
+                console.assert(r.value.length > 0)
+                return r.value;
+            }
+
+
+        }
+        
+    }
+}
+
+export function readFromMemory(data: Buffer): BodyReader {
+    let done = false;
+    return {
+        length: data.length,
+        read: async (): Promise<Buffer> => {
+            if(done){
+                return Buffer.from('')
+            } else {
+                done = true 
+                return data;
+            }
+
+        }
+    }
 
 }
+
+export const readerFromMemory = readFromMemory;
+
+function encodeHTTPResp(resp: HTTPRes): Buffer {
+    const statusText: { [key: number]: string } = {
+        200: 'OK',
+        400: 'Bad Request',
+        413: 'Payload Too Large',
+        500: 'Internal Server Error',
+    };
+    const text = statusText[resp.code] || 'OK';
+    const parts: Buffer[] = [];
+    parts.push(Buffer.from(`HTTP/1.1 ${resp.code} ${text}\r\n`));
+    for (const header of resp.headers) {
+        parts.push(header);
+        parts.push(Buffer.from('\r\n'));
+    }
+    parts.push(Buffer.from('\r\n'));
+    return Buffer.concat(parts);
+}
+
+export async function writeHTTPResp (conn: TCPConn, resp: HTTPRes): Promise<void> {
+    console.assert(!fieldGet(resp.headers, 'Content-Length'));
+    if(resp.body.length < 0){
+        resp.headers.push(Buffer.from(`Transfer-Encoding: chunked`))
+    } else {
+        resp.headers.push(Buffer.from(`Content-Length: ${resp.body.length}`))
+    }
+    const headerBuf = encodeHTTPResp(resp);
+    await soWrite(conn, headerBuf);
+    if(resp.body.length < 0){
+        await writeBodyChunked(conn, resp)
+    } else {
+        await writeBodyWithContentLength(conn, resp)
+    }
+}
+
+async function writeBodyWithContentLength(conn: TCPConn, resp: HTTPRes): Promise<void>{
+    while(true){
+        const data = await resp.body.read()
+        if(data.length === 0) break;
+        await soWrite(conn, data)
+    }
+}
+
+async function writeBodyChunked(conn: TCPConn, resp: HTTPRes): Promise<void> {
+    const crlf = Buffer.from('\r\n');
+    while(true){
+        const data = await resp.body.read() 
+        if(data.length === 0){
+            await soWrite(conn, Buffer.from('0\r\n\r\n'));
+            break;
+        }
+        const chunk = Buffer.concat([
+            Buffer.from(data.length.toString(16)), 
+            crlf, 
+            data, 
+            crlf
+        ]);
+        await soWrite(conn, chunk);
+        
+    }
+}
+
+export function readerFromStaticFile(fp: fs.FileHandle, size: number): BodyReader {
+    let position = 0;
+    const chunkSize = 64 * 1024; // 64KB chunks
+    return {
+        length: size,
+        read: async (): Promise<Buffer> => {
+            if (position >= size) {
+                return Buffer.from('');
+            }
+            const remaining = size - position;
+            const readSize = Math.min(chunkSize, remaining);
+            const buffer = Buffer.alloc(readSize);
+            const r = await fp.read({ buffer, position, length: readSize });
+            position += r.bytesRead;
+            if (r.bytesRead === 0 && position < size) {
+                throw new HTTPError(500, 'File Changed');
+            }
+            return buffer.subarray(0, r.bytesRead);
+        },
+        close: async () => fp.close(),
+    }
+}
+

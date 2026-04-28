@@ -1,8 +1,8 @@
 import * as net from 'net'
+import * as fs from 'fs/promises'
 import { bufPop, bufPush, DynBuf } from './http-server-promise'
-import { validateHeaderName } from 'http'
 import { TCPConn, HTTPReq, HTTPRes, BodyReader } from './types'
-import { cutMessage } from './helper'
+import { cutMessage, handleReq, readerFromReq, HTTPError, writeHTTPResp, readerFromMemory } from './helper'
 
 function soInit(socket: net.Socket): TCPConn {
     const conn: TCPConn = { socket: socket, err: null, end: false, reader: null }
@@ -28,7 +28,7 @@ function soInit(socket: net.Socket): TCPConn {
     })
     return conn;
 }
-async function soRead(conn: TCPConn): Promise<Buffer> {
+export async function soRead(conn: TCPConn): Promise<Buffer> {
     console.assert(!conn.reader)
     return new Promise((res, rej) => {
         if (conn.end) {
@@ -43,7 +43,7 @@ async function soRead(conn: TCPConn): Promise<Buffer> {
     })
 }
 
-async function soWrite(conn: TCPConn, data: Buffer): Promise<void> {
+export async function soWrite(conn: TCPConn, data: Buffer): Promise<void> {
     console.assert(data.length > 0)
     return new Promise((res, rej) => {
         if (conn.err) {
@@ -72,7 +72,7 @@ async function serverClient(conn: TCPConn): Promise<void> {
             bufPush(buf, data)
             // EOF? 
             if (data.length === 0 && buf.length === 0) {
-                console.log('end connection')
+				console.log('[conn] end connection')
                 break;
             }
             if (data.length === 0) {
@@ -83,14 +83,27 @@ async function serverClient(conn: TCPConn): Promise<void> {
         }
         const reqBody: BodyReader = readerFromReq(conn, buf, msg);
         const res: HTTPRes = await handleReq(msg, reqBody);
+
         await writeHTTPResp(conn, res);
 
         if (msg.version === '1.0') {
+			console.log('[conn] HTTP/1.0, closing after response');
             return;
         }
-        while ((await reqBody.read()).length > 0) { /* empty */ }
+		// drain any remaining body
+		let drained = 0;
+		while (true) {
+			const chunk = await reqBody.read();
+			if (chunk.length === 0) break;
+			drained += chunk.length;
+		}
+		if (drained > 0) {
+			console.log(`[req] drained remaining body bytes: ${drained}`);
+		}
     }
 }
+
+
 
 
 async function newConn(socket: net.Socket): Promise<void> {
@@ -98,7 +111,6 @@ async function newConn(socket: net.Socket): Promise<void> {
     try {
         await serverClient(conn);
     } catch (exc) {
-        console.error('exception:', exc);
         if (exc instanceof HTTPError) {
             // intended to send an error response
             const resp: HTTPRes = {
@@ -116,8 +128,10 @@ async function newConn(socket: net.Socket): Promise<void> {
 }
 
 
-const server = net.createServer({ pauseOnConnect: true });
+const server = net.createServer({ pauseOnConnect: true, noDelay: true });
 server.on('error', (err: Error) => { throw err; });
 server.on('connection', newConn);
-server.listen({ host: '127.0.0.1', port: 1234 });
+server.listen({ host: '127.0.0.1', port: 1222 }, () => {
+	console.log('[srv] listening on http://127.0.0.1:1222');
+});
 
